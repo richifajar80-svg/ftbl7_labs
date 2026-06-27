@@ -96,18 +96,14 @@ def fetch_google_trends(keyword: str, timeframe: str = "today 3-m") -> dict:
     try:
         from pytrends.request import TrendReq
 
-        # Coba tanpa cat filter dulu, fallback ke cat=0 jika kosong
-        for cat in [20, 0]:
-            pt = TrendReq(hl="id-ID", tz=420, timeout=(10, 25), retries=2, backoff_factor=0.5)
-            pt.build_payload([keyword], cat=cat, timeframe=timeframe, geo="ID")
+        # Coba cat=20 (Sports) dulu, fallback ke cat=0 jika kosong
+        iot = None
+        for cat, geo in [(20, "ID"), (0, "ID"), (0, "")]:
+            pt = TrendReq(hl="id-ID", tz=420, timeout=(10, 25))
+            pt.build_payload([keyword], cat=cat, timeframe=timeframe, geo=geo)
             iot = pt.interest_over_time()
             if not iot.empty and keyword in iot.columns:
                 break
-        else:
-            # Coba tanpa filter geo (global)
-            pt = TrendReq(hl="id-ID", tz=420, timeout=(10, 25))
-            pt.build_payload([keyword], cat=0, timeframe=timeframe, geo="")
-            iot = pt.interest_over_time()
 
         if iot.empty or keyword not in iot.columns:
             return {
