@@ -1,14 +1,12 @@
 # =============================================================================
 # modules/clip_detector.py  —  FTBL7 Labs  —  Modul 1
 #
-# Flow lengkap:
+# Flow:
 #   Input URL + API Key
-#     └─► fetch_transcript()  → 3-layer bypass
-#           ├─ Layer 1: youtube-transcript-api
-#           ├─ Layer 2: yt-dlp
-#           └─ Layer 3: manual input (fallback UI)
-#     └─► analyze_with_gemini()
-#           └─► render_results()
+#     └─► fetch_transcript()  → multi-layer bypass
+#     └─► score_segments()    → Pass 1: Gemini scorer semua segmen
+#     └─► analyze_top_clips() → Pass 2: Gemini deep analyst top segmen
+#           └─► _render_results()
 # =============================================================================
 
 import re
@@ -21,13 +19,11 @@ import streamlit as st
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  CSS TAMBAHAN (diinjeksi sekali saat modul di-load)
+#  CSS TAMBAHAN
 # ─────────────────────────────────────────────────────────────────────────────
 
 _CSS = """
 <style>
-/* ── Clip Detector component styles (matches app.py navy theme) ── */
-
 .cd-card {
     background: rgba(15,23,41,0.75);
     backdrop-filter: blur(8px);
@@ -41,7 +37,6 @@ _CSS = """
     border-color: rgba(59,130,246,0.32);
     box-shadow: 0 0 24px rgba(59,130,246,0.1);
 }
-
 .cd-header { margin-bottom: 1.5rem; }
 .cd-header h2 {
     margin: 0 0 4px;
@@ -51,7 +46,6 @@ _CSS = """
     letter-spacing: -0.02em;
 }
 .cd-header p { margin: 0; font-size: 0.875rem; color: #7a8fba !important; }
-
 .cd-label {
     font-size: 0.65rem;
     font-weight: 600;
@@ -60,7 +54,6 @@ _CSS = """
     color: #4a5878;
     margin-bottom: 5px;
 }
-
 .cd-quote {
     background: rgba(0,0,0,0.3);
     border-left: 3px solid rgba(59,130,246,0.4);
@@ -72,7 +65,6 @@ _CSS = """
     margin: 0.65rem 0;
     line-height: 1.5;
 }
-
 .cd-badge {
     display: inline-block;
     padding: 3px 11px;
@@ -87,7 +79,6 @@ _CSS = """
 .b-purple { background:rgba(139,92,246,0.15);   color:#a78bfa; }
 .b-orange { background:rgba(245,158,11,0.15);   color:#fbbf24; }
 .b-green  { background:rgba(16,185,129,0.15);   color:#34d399; }
-
 .hook-box {
     background: #0b1120;
     border: 1px solid rgba(59,130,246,0.1);
@@ -95,25 +86,9 @@ _CSS = """
     padding: 0.85rem 1rem;
     margin-top: 0.5rem;
 }
-.hook-title {
-    font-size: 0.95rem;
-    font-weight: 600;
-    color: #f0f4ff !important;
-    line-height: 1.4;
-}
-.hook-cap {
-    font-size: 0.82rem;
-    color: #c8d3ea !important;
-    margin-top: 5px;
-    line-height: 1.5;
-}
-.hook-angle {
-    font-size: 0.75rem;
-    color: #4a5878 !important;
-    margin-top: 5px;
-    font-style: italic;
-}
-
+.hook-title { font-size: 0.95rem; font-weight: 600; color: #f0f4ff !important; line-height: 1.4; }
+.hook-cap   { font-size: 0.82rem; color: #c8d3ea !important; margin-top: 5px; line-height: 1.5; }
+.hook-angle { font-size: 0.75rem; color: #4a5878 !important; margin-top: 5px; font-style: italic; }
 .json-out {
     background: #060b18;
     border: 1px solid rgba(59,130,246,0.15);
@@ -128,14 +103,6 @@ _CSS = """
     overflow-y: auto;
     line-height: 1.6;
 }
-
-.summary-stat {
-    text-align: center;
-    padding: 0.5rem 1.5rem;
-    border-left: 1px solid rgba(59,130,246,0.15);
-}
-.summary-stat .num { font-size: 2.2rem; font-weight: 800; color: #3b82f6; line-height: 1; }
-.summary-stat .lbl { font-size: 0.65rem; color: #4a5878; text-transform: uppercase; letter-spacing: 0.1em; margin-top: 4px; }
 </style>
 """
 
@@ -145,19 +112,16 @@ _CSS = """
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _extract_video_id(url: str) -> str | None:
-    """Ekstrak 11-karakter video ID dari berbagai format URL YouTube."""
     match = re.search(r"(?:v=|youtu\.be/|embed/|shorts/)([A-Za-z0-9_-]{11})", url)
     return match.group(1) if match else None
 
 
 def _entries_to_text(entries: list) -> str:
-    """Gabungkan list transcript entries → plain text."""
     return " ".join(e.get("text", "") for e in entries if e.get("text")).strip()
 
 
 def _parse_vtt(content: str) -> str:
-    """Parse .vtt subtitle file → plain text tanpa tag & timestamp."""
-    lines, seen, prev = [], set(), None
+    lines, prev = [], None
     for line in content.splitlines():
         line = line.strip()
         if not line:
@@ -175,7 +139,6 @@ def _parse_vtt(content: str) -> str:
 
 
 def _run_ytdlp(url: str, extra_args: list = []) -> Optional[str]:
-    """Jalankan yt-dlp dengan argumen tambahan, return plain text atau None."""
     with tempfile.TemporaryDirectory() as tmpdir:
         cmd = [
             "python", "-m", "yt_dlp",
@@ -200,41 +163,33 @@ def _run_ytdlp(url: str, extra_args: list = []) -> Optional[str]:
 
 
 def fetch_transcript(url: str) -> dict:
-    """
-    Ambil transkrip dengan 5-layer bypass otomatis.
-    Urutan: Chrome cookies → Edge cookies → Firefox cookies → no cookies → transcript-api
-
-    Return:
-        { success, transcript, method, video_id, error }
-    """
     video_id = _extract_video_id(url)
     if not video_id:
         return {"success": False, "transcript": None, "method": "none",
                 "video_id": None, "error": "URL YouTube tidak valid."}
 
-    # ── Deteksi environment: cloud tidak punya browser ───────────────────────
-    import os
-    is_cloud = os.environ.get("STREAMLIT_SHARING_MODE") or \
-               os.environ.get("HOME", "").startswith("/home/appuser") or \
-               not os.path.exists(os.path.expanduser("~/.config/google-chrome"))
+    is_cloud = (
+        os.environ.get("STREAMLIT_SHARING_MODE") or
+        os.environ.get("HOME", "").startswith("/home/appuser") or
+        not os.path.exists(os.path.expanduser("~/.config/google-chrome"))
+    )
 
-    # ── Layer 1–4: yt-dlp (skip browser cookies di cloud) ────────────────────
     if is_cloud:
         layers = [("yt-dlp", [])]
     else:
         layers = [
-            ("yt-dlp + Chrome", ["--cookies-from-browser", "chrome"]),
-            ("yt-dlp + Edge",   ["--cookies-from-browser", "edge"]),
-            ("yt-dlp + Firefox",["--cookies-from-browser", "firefox"]),
-            ("yt-dlp",          []),
+            ("yt-dlp + Chrome",  ["--cookies-from-browser", "chrome"]),
+            ("yt-dlp + Edge",    ["--cookies-from-browser", "edge"]),
+            ("yt-dlp + Firefox", ["--cookies-from-browser", "firefox"]),
+            ("yt-dlp",           []),
         ]
+
     for method_name, args in layers:
         t = _run_ytdlp(url, args)
         if t and len(t) > 100:
             return {"success": True, "transcript": t, "method": method_name,
                     "video_id": video_id, "error": None}
 
-    # ── Layer 5: youtube-transcript-api ──────────────────────────────────────
     try:
         from youtube_transcript_api import YouTubeTranscriptApi
         tl = YouTubeTranscriptApi.list_transcripts(video_id)
@@ -274,7 +229,6 @@ def fetch_transcript(url: str) -> dict:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _extract_json(text: str) -> str:
-    """Keluarkan JSON murni dari response Gemini (bisa terbungkus markdown)."""
     m = re.search(r"```(?:json)?\s*([\s\S]+?)\s*```", text)
     if m:
         return m.group(1).strip()
@@ -285,13 +239,9 @@ def _extract_json(text: str) -> str:
 
 
 def _split_segments(transcript: str, words_per_seg: int = 150) -> list:
-    """
-    Bagi transcript menjadi segmen-segmen dengan overlap 30 kata.
-    Return: list of { index, text, position_pct }
-    """
     words = transcript.split()
     total = len(words)
-    step  = words_per_seg - 30  # overlap 30 kata
+    step  = words_per_seg - 30
     segs  = []
     i     = 0
     while i < total:
@@ -308,7 +258,6 @@ def _split_segments(transcript: str, words_per_seg: int = 150) -> list:
 
 def _gemini_call(client, prompt: str, temperature: float = 0.5,
                  max_tokens: int = 2048) -> str:
-    """Wrapper Gemini call dengan retry 429."""
     import time
     for attempt in range(3):
         try:
@@ -326,23 +275,15 @@ def _gemini_call(client, prompt: str, temperature: float = 0.5,
     raise RuntimeError("Gemini rate limit: coba lagi dalam 1 menit.")
 
 
-# ── PASS 1: Segment Scorer ────────────────────────────────────────────────────
-
 def score_segments(transcript: str, title: str, api_key: str) -> dict:
-    """
-    Pass 1 — Gemini Flash sebagai 'filter kasar':
-    Score semua segmen transcript, pilih top kandidat terbaik.
-    """
+    """Pass 1 — Gemini scorer: scan semua segmen, pilih top kandidat."""
     try:
         from google import genai
     except ImportError:
         return {"success": False, "error": "Library google-genai belum terinstall."}
 
     client = genai.Client(api_key=api_key)
-    segs   = _split_segments(transcript)
-
-    # Batasi maks 12 segmen agar prompt tidak terlalu panjang
-    segs = segs[:12]
+    segs   = _split_segments(transcript)[:12]
 
     seg_text = "\n\n".join(
         f"[SEG-{s['index']} | posisi {s['position_pct']}% video]:\n{s['text'][:500]}"
@@ -385,18 +326,13 @@ composite = rata-rata semua score dengan bobot viral_score x2."""
         data = json.loads(_extract_json(raw))
         return {"success": True, "data": data, "segments": segs, "error": None}
     except json.JSONDecodeError as e:
-        return {"success": False, "error": f"Gagal parse JSON Pass 1: {e}"}
+        return {"success": False, "segments": segs, "error": f"Gagal parse JSON Pass 1: {e}"}
     except Exception as e:
-        return {"success": False, "error": f"Pass 1 error: {e}"}
+        return {"success": False, "segments": segs, "error": f"Pass 1 error: {e}"}
 
-
-# ── PASS 2: Deep Analyzer ─────────────────────────────────────────────────────
 
 def analyze_top_clips(scored_data: dict, title: str, api_key: str) -> dict:
-    """
-    Pass 2 — Gemini Flash sebagai 'deep analyst':
-    Analisis mendalam 5 segmen terbaik dari Pass 1.
-    """
+    """Pass 2 — Gemini deep analyst: analisis mendalam top segmen."""
     try:
         from google import genai
     except ImportError:
@@ -408,9 +344,8 @@ def analyze_top_clips(scored_data: dict, title: str, api_key: str) -> dict:
     top_idx  = p1_data.get("top_indices", [])[:5]
     scored   = {s["index"]: s for s in p1_data.get("scored_segments", [])}
     summary  = p1_data.get("video_summary", "")
+    seg_map  = {s["index"]: s for s in segments}
 
-    # Ambil teks segmen asli untuk top candidates
-    seg_map = {s["index"]: s for s in segments}
     top_segs_text = "\n\n".join(
         f"[KANDIDAT #{i+1} — SEG-{idx} | posisi {seg_map.get(idx,{}).get('position_pct',0)}%]\n"
         f"Score: viral={scored.get(idx,{}).get('viral_score',0)} "
@@ -425,7 +360,7 @@ def analyze_top_clips(scored_data: dict, title: str, api_key: str) -> dict:
 VIDEO: "{title or 'Video Sepak Bola'}"
 RINGKASAN: {summary}
 
-Berikut 5 segmen terpilih yang sudah di-score oleh AI scorer.
+Berikut segmen terpilih yang sudah di-score oleh AI scorer.
 Lakukan analisis mendalam dan buat hook konten untuk setiap segmen.
 
 {top_segs_text}
@@ -435,14 +370,14 @@ TARGET: Fans sepak bola Indonesia 18-35 tahun, platform YouTube Shorts / TikTok 
 OUTPUT: JSON valid saja.
 
 {{
-  "video_summary": "{summary}",
+  "video_summary": "ringkasan video",
   "clips": [
     {{
       "rank": 1,
-      "timestamp_hint": "Perkiraan posisi video (misal: '5 menit pertama', 'bagian tengah')",
-      "quote": "Kutipan langsung terbaik dari segmen, maks 120 karakter",
+      "timestamp_hint": "Perkiraan posisi video",
+      "quote": "Kutipan langsung terbaik, maks 120 karakter",
       "topic": "Topik singkat, maks 60 karakter",
-      "why_viral": "Alasan spesifik kenapa ini viral di Indonesia, maks 150 karakter",
+      "why_viral": "Alasan spesifik, maks 150 karakter",
       "emotion_trigger": "KONTROVERSI | EMOSIONAL | MENGEJUTKAN | HUMOR | INSPIRATIF",
       "viral_score": 8.5,
       "score_breakdown": {{
@@ -452,21 +387,9 @@ OUTPUT: JSON valid saja.
         "kontroversi": 6.0
       }},
       "hooks": {{
-        "kontroversial": {{
-          "judul": "Hook yang memancing debat, maks 80 karakter",
-          "caption": "Caption media sosial + hashtag, maks 160 karakter",
-          "angle": "Sudut pandang, maks 60 karakter"
-        }},
-        "emosional": {{
-          "judul": "Hook yang menyentuh perasaan, maks 80 karakter",
-          "caption": "Caption media sosial + hashtag, maks 160 karakter",
-          "angle": "Sudut pandang, maks 60 karakter"
-        }},
-        "pertanyaan": {{
-          "judul": "Hook berupa pertanyaan, maks 80 karakter",
-          "caption": "Caption media sosial + hashtag, maks 160 karakter",
-          "angle": "Sudut pandang, maks 60 karakter"
-        }}
+        "kontroversial": {{"judul": "", "caption": "", "angle": ""}},
+        "emosional":     {{"judul": "", "caption": "", "angle": ""}},
+        "pertanyaan":    {{"judul": "", "caption": "", "angle": ""}}
       }}
     }}
   ],
@@ -486,10 +409,8 @@ Semua teks Bahasa Indonesia yang natural, engaging, dan spesifik untuk pasar lok
         return {"success": False, "error": f"Pass 2 error: {e}"}
 
 
-# ── LEGACY (single-pass fallback) ─────────────────────────────────────────────
-
 def analyze_with_gemini(transcript: str, title: str, api_key: str) -> dict:
-    """Single-pass fallback — dipakai manual input & jika 2-pass gagal."""
+    """Single-pass fallback — untuk manual input & jika 2-pass gagal."""
     try:
         from google import genai
     except ImportError:
@@ -499,7 +420,7 @@ def analyze_with_gemini(transcript: str, title: str, api_key: str) -> dict:
     client = genai.Client(api_key=api_key)
     prompt = f"""
 Kamu adalah Senior Content Strategist YouTube sepak bola Indonesia.
-Analisis transkrip berikut → deteksi 5 momen paling viral untuk Short Clip (≤60 detik).
+Analisis transkrip → deteksi 5 momen paling viral untuk Short Clip (60 detik).
 
 VIDEO: {title or 'tidak diketahui'}
 TRANSKRIP: {transcript[:8000]}
@@ -565,7 +486,6 @@ _HOOK_TABS = [
 
 
 def _render_score_bars(breakdown: dict):
-    """Mini score bars untuk viral / emosi / quotable / kontroversi."""
     dims = [
         ("Viral",       breakdown.get("viral", 0),      "#3b82f6"),
         ("Emosi",       breakdown.get("emosi", 0),       "#f87171"),
@@ -585,7 +505,6 @@ def _render_score_bars(breakdown: dict):
 
 
 def _render_clip_card(clip: dict):
-    """Render satu kartu momen viral + score breakdown + 3 tab hook."""
     rank      = clip.get("rank", "?")
     topic     = clip.get("topic", "")
     quote     = clip.get("quote", "")
@@ -624,12 +543,10 @@ def _render_clip_card(clip: dict):
     </div>
     """, unsafe_allow_html=True)
 
-    # Score breakdown (jika ada)
     if breakdown:
         with st.expander("📊 Score Breakdown", expanded=False):
             _render_score_bars(breakdown)
 
-    # ── 3 Hook Tabs ──────────────────────────────────────────────────────────
     tabs = st.tabs([label for label, _ in _HOOK_TABS])
     for tab, (_, key) in zip(tabs, _HOOK_TABS):
         h = hooks.get(key, {})
@@ -656,13 +573,11 @@ def _render_clip_card(clip: dict):
 
 
 def _render_results(data: dict):
-    """Render seluruh hasil analisis Gemini."""
     clips    = data.get("clips", [])
     hashtags = data.get("top_hashtags", [])
     posting  = data.get("posting_recommendation", "")
     summary  = data.get("video_summary", "-")
 
-    # ── Summary bar ──────────────────────────────────────────────────────────
     badges = "".join(
         f'<span class="cd-badge b-cyan" style="margin-right:4px;">{t}</span>'
         for t in hashtags
@@ -693,7 +608,6 @@ def _render_results(data: dict):
     for clip in clips:
         _render_clip_card(clip)
 
-    # ── JSON Export ───────────────────────────────────────────────────────────
     with st.expander("📦 Export JSON"):
         json_str = json.dumps(data, ensure_ascii=False, indent=2)
         st.markdown(f'<div class="json-out">{json_str}</div>', unsafe_allow_html=True)
@@ -708,10 +622,8 @@ def _render_results(data: dict):
 def render():
     """Dipanggil dari app.py saat menu Clip Detector aktif."""
 
-    # Inject CSS modul ini
     st.markdown(_CSS, unsafe_allow_html=True)
 
-    # ── Header ───────────────────────────────────────────────────────────────
     st.markdown("""
     <div class="cd-header">
         <h2>🎬 Clip Detector</h2>
@@ -719,7 +631,6 @@ def render():
     </div>
     """, unsafe_allow_html=True)
 
-    # ── Form Input ───────────────────────────────────────────────────────────
     with st.container():
         st.markdown('<div class="cd-card">', unsafe_allow_html=True)
         st.markdown("#### ⚙️ Input")
@@ -737,7 +648,7 @@ def render():
                 placeholder="Misal: Derby Indonesia 2024",
             )
 
-        # ── API Key: baca dari st.secrets dulu, fallback ke manual input ────
+        # API Key dari secrets, fallback ke input manual
         _secret_key = ""
         try:
             _secret_key = st.secrets["GEMINI_API_KEY"]
@@ -762,7 +673,6 @@ def render():
                 help="Dapatkan di aistudio.google.com/app/apikey",
             )
 
-        # ── Manual transcript toggle ─────────────────────────────────────────
         use_manual = st.checkbox("✍️ Masukkan transkrip manual (tanpa URL)")
         manual_transcript = ""
         if use_manual:
@@ -774,20 +684,17 @@ def render():
 
         st.markdown('</div>', unsafe_allow_html=True)
 
-    # ── Tombol Proses ────────────────────────────────────────────────────────
     btn_cols = st.columns([1, 2, 1])
     with btn_cols[1]:
         run = st.button("🚀 Proses Video", type="primary", use_container_width=True)
 
     if not run:
-        # Tampilkan hasil sebelumnya jika ada
         if "cd_result" in st.session_state and st.session_state["cd_result"]:
             st.divider()
             st.caption("📌 Hasil terakhir — tekan 'Proses Video' untuk analisis baru")
             _render_results(st.session_state["cd_result"])
         return
 
-    # ── Validasi input ───────────────────────────────────────────────────────
     if not api_key:
         st.error("❌ Masukkan Gemini API Key terlebih dahulu.")
         return
@@ -802,11 +709,9 @@ def render():
         st.session_state["cd_transcript"] = transcript
 
         with st.expander("📄 Preview Transkrip"):
-            word_count = len(transcript.split())
-            st.caption(f"📝 {word_count} kata · {len(transcript)} karakter")
+            st.caption(f"📝 {len(transcript.split())} kata · {len(transcript)} karakter")
             st.text(transcript[:600] + ("..." if len(transcript) > 600 else ""))
 
-        # Single-pass untuk manual input
         with st.status("🤖 Menganalisis transkrip manual...", expanded=True) as status:
             st.write("Mendeteksi momen viral & membuat hook options...")
             gresult = analyze_with_gemini(transcript, title, api_key)
@@ -826,17 +731,14 @@ def render():
         st.error("❌ Masukkan URL YouTube atau aktifkan input manual.")
         return
 
-    # ── Step 1: Fetch Transcript ─────────────────────────────────────────────
     with st.status("📥 Mengambil transkrip dari YouTube...", expanded=True) as status:
         st.write("Mencoba beberapa metode bypass...")
         result = fetch_transcript(url)
 
         if result["success"]:
-            method = result.get("method", "unknown")
-            chars  = len(result["transcript"])
-            words  = len(result["transcript"].split())
+            words = len(result["transcript"].split())
             status.update(
-                label=f"✅ Transkrip berhasil diambil via {method} ({words} kata)",
+                label=f"✅ Transkrip via {result['method']} ({words} kata)",
                 state="complete",
             )
         else:
@@ -844,8 +746,8 @@ def render():
             st.error(result["error"])
             with st.expander("💡 Tips"):
                 st.markdown("""
-                - Pastikan video punya **auto-caption** YouTube  
-                - Coba video yang lebih populer / berbahasa Indonesia  
+                - Pastikan video punya **auto-caption** YouTube
+                - Coba video yang lebih populer / berbahasa Indonesia
                 - Gunakan **✍️ Input Manual** di atas jika punya transkrip sendiri
                 """)
             return
@@ -854,24 +756,23 @@ def render():
     st.session_state["cd_transcript"] = transcript
 
     with st.expander("📄 Preview Transkrip"):
-        word_count = len(transcript.split())
-        st.caption(f"📝 {word_count} kata · {len(transcript)} karakter")
+        st.caption(f"📝 {len(transcript.split())} kata · {len(transcript)} karakter")
         st.text(transcript[:600] + ("..." if len(transcript) > 600 else ""))
 
-    # ── Pass 1: Segment Scorer ────────────────────────────────────────────
+    # ── Pass 1: Segment Scorer ────────────────────────────────────────────────
+    p1 = {"success": False}
     with st.status("⚡ Pass 1 — Gemini Scorer: scanning semua segmen...",
                    expanded=True) as status:
         st.write("🔍 Membagi transcript menjadi segmen-segmen...")
         p1 = score_segments(transcript, title, api_key)
 
         if p1["success"]:
-            n_segs  = len(p1.get("segments", []))
-            n_top   = len(p1["data"].get("top_indices", []))
+            n_segs = len(p1.get("segments", []))
+            n_top  = len(p1["data"].get("top_indices", []))
             status.update(
                 label=f"✅ Pass 1 selesai — {n_segs} segmen di-scan, {n_top} kandidat terpilih",
                 state="complete",
             )
-            # Preview scoring
             top_idx = p1["data"].get("top_indices", [])
             scored  = {s["index"]: s for s in p1["data"].get("scored_segments", [])}
             cols = st.columns(min(len(top_idx), 5))
@@ -883,10 +784,10 @@ def render():
                     s.get("topic", "")[:20],
                 )
         else:
-            status.update(label=f"⚠️ Pass 1 gagal, fallback ke single-pass", state="error")
+            status.update(label="⚠️ Pass 1 gagal — fallback ke single-pass", state="error")
             st.warning(f"Pass 1: {p1['error']} — menggunakan single-pass.")
 
-    # ── Pass 2: Deep Analyzer ─────────────────────────────────────────────
+    # ── Pass 2: Deep Analyzer ─────────────────────────────────────────────────
     with st.status("🧠 Pass 2 — Gemini Deep Analyzer: analisis kandidat terbaik...",
                    expanded=True) as status:
         st.write("Membuat hook, caption, dan strategi konten...")
@@ -905,24 +806,3 @@ def render():
 
     st.session_state["cd_result"] = gresult["data"]
     _render_results(gresult["data"])
-           key="cd_manual_key",
-            help="Bisa berbeda dari input di atas",
-        )
-
-        if st.button("🤖 Analisis Manual", key="cd_btn_manual"):
-            if not manual_text.strip():
-                st.warning("⚠️ Paste transkrip terlebih dahulu.")
-            elif not manual_key.strip():
-                st.warning("⚠️ Masukkan Gemini API Key.")
-            else:
-                with st.status("🤖 Menganalisis transkrip manual...", expanded=True) as status:
-                    st.write("Mengirim ke Gemini 1.5 Pro...")
-                    gresult = analyze_with_gemini(manual_text, manual_title, manual_key)
-
-                    if gresult["success"]:
-                        status.update(label="✅ Selesai!", state="complete")
-                        st.session_state["cd_result"] = gresult["data"]
-                        _render_results(gresult["data"])
-                    else:
-                        status.update(label=f"❌ {gresult['error']}", state="error")
-                        st.error(gresult["error"])
