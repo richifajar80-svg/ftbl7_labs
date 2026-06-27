@@ -228,7 +228,7 @@ Semua analisis harus spesifik untuk pasar Indonesia, bahasa natural dan actionab
     for attempt in range(3):
         try:
             resp = client.models.generate_content(
-                model="gemini-2.0-flash",
+                model="gemini-2.0-flash-lite",
                 contents=prompt,
                 config={"temperature": 0.7, "max_output_tokens": 3000},
             )

@@ -270,7 +270,7 @@ def fetch_transcript(url: str) -> dict:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  GEMINI HELPERS
+#  GEMINI 2-PASS PIPELINE
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _extract_json(text: str) -> str:
@@ -284,56 +284,173 @@ def _extract_json(text: str) -> str:
     return text
 
 
-def analyze_with_gemini(transcript: str, title: str, api_key: str) -> dict:
+def _split_segments(transcript: str, words_per_seg: int = 150) -> list:
     """
-    Kirim transkrip ke Gemini 2.0 Flash via SDK baru (google-genai).
-    Support key format AQ. (AI Studio terbaru) maupun AIza (lama).
-    Return: { success, data, raw, error }
+    Bagi transcript menjadi segmen-segmen dengan overlap 30 kata.
+    Return: list of { index, text, position_pct }
+    """
+    words = transcript.split()
+    total = len(words)
+    step  = words_per_seg - 30  # overlap 30 kata
+    segs  = []
+    i     = 0
+    while i < total:
+        chunk = " ".join(words[i : i + words_per_seg])
+        if len(chunk.strip()) > 80:
+            segs.append({
+                "index"       : len(segs) + 1,
+                "text"        : chunk,
+                "position_pct": round(i / total * 100) if total else 0,
+            })
+        i += step
+    return segs
+
+
+def _gemini_call(client, prompt: str, temperature: float = 0.5,
+                 max_tokens: int = 2048) -> str:
+    """Wrapper Gemini call dengan retry 429."""
+    import time
+    for attempt in range(3):
+        try:
+            resp = client.models.generate_content(
+                model="gemini-2.0-flash-lite",
+                contents=prompt,
+                config={"temperature": temperature, "max_output_tokens": max_tokens},
+            )
+            return resp.text.strip()
+        except Exception as e:
+            if "429" in str(e) and attempt < 2:
+                time.sleep(35)
+                continue
+            raise
+    raise RuntimeError("Gemini rate limit: coba lagi dalam 1 menit.")
+
+
+# ── PASS 1: Segment Scorer ────────────────────────────────────────────────────
+
+def score_segments(transcript: str, title: str, api_key: str) -> dict:
+    """
+    Pass 1 — Gemini Flash sebagai 'filter kasar':
+    Score semua segmen transcript, pilih top kandidat terbaik.
     """
     try:
         from google import genai
-        from google.genai import types as genai_types
     except ImportError:
-        return {"success": False, "data": None, "raw": "",
-                "error": "Library google-genai belum terinstall. Jalankan: pip install google-genai"}
+        return {"success": False, "error": "Library google-genai belum terinstall."}
 
     client = genai.Client(api_key=api_key)
+    segs   = _split_segments(transcript)
 
-    prompt = f"""
-Kamu adalah Senior Content Strategist untuk platform YouTube sepak bola Indonesia.
+    # Batasi maks 12 segmen agar prompt tidak terlalu panjang
+    segs = segs[:12]
 
-TUGAS: Analisis transkrip di bawah ini, lalu deteksi 5 momen paling berpotensi viral/emosional untuk dijadikan short clip (≤60 detik).
+    seg_text = "\n\n".join(
+        f"[SEG-{s['index']} | posisi {s['position_pct']}% video]:\n{s['text'][:500]}"
+        for s in segs
+    )
 
-KONTEKS:
-- Judul video : {title or 'tidak diketahui'}
-- Target      : Fans sepak bola Indonesia usia 18–35 tahun
-- Platform    : YouTube Shorts, TikTok, Instagram Reels
+    prompt = f"""Kamu adalah AI scorer konten sepak bola Indonesia.
 
-TRANSKRIP (maks 5000 karakter):
----
-{transcript[:5000]}
----
+VIDEO: "{title or 'Video Sepak Bola'}"
 
-KRITERIA MOMEN VIRAL:
-1. Kontroversi / drama / komentar panas
-2. Momen emosional tinggi (gol, eliminasi, kejatuhan)
-3. Fakta / statistik mengejutkan
-4. Prediksi atau klaim bold
-5. Humor / reaksi spontan
+Baca setiap segmen transcript berikut dan beri score 0-10 untuk tiap dimensi.
 
-OUTPUT: Hanya JSON valid, tidak ada teks lain.
+{seg_text}
+
+OUTPUT: JSON valid saja. Jangan ada teks lain.
 
 {{
-  "video_summary": "Ringkasan 1–2 kalimat",
+  "scored_segments": [
+    {{
+      "index": 1,
+      "viral_score": 8.5,
+      "emotion_score": 7.0,
+      "quotability": 9.0,
+      "controversy": 6.0,
+      "composite": 7.8,
+      "best_quote": "kutipan terbaik dari segmen ini (maks 120 karakter)",
+      "topic": "topik singkat (maks 50 karakter)",
+      "position_pct": 0
+    }}
+  ],
+  "top_indices": [3, 1, 5],
+  "video_summary": "Ringkasan 1 kalimat tentang video ini"
+}}
+
+top_indices: 3-5 index segmen terbaik urut dari tertinggi composite score.
+composite = rata-rata semua score dengan bobot viral_score x2."""
+
+    try:
+        raw  = _gemini_call(client, prompt, temperature=0.3, max_tokens=3000)
+        data = json.loads(_extract_json(raw))
+        return {"success": True, "data": data, "segments": segs, "error": None}
+    except json.JSONDecodeError as e:
+        return {"success": False, "error": f"Gagal parse JSON Pass 1: {e}"}
+    except Exception as e:
+        return {"success": False, "error": f"Pass 1 error: {e}"}
+
+
+# ── PASS 2: Deep Analyzer ─────────────────────────────────────────────────────
+
+def analyze_top_clips(scored_data: dict, title: str, api_key: str) -> dict:
+    """
+    Pass 2 — Gemini Flash sebagai 'deep analyst':
+    Analisis mendalam 5 segmen terbaik dari Pass 1.
+    """
+    try:
+        from google import genai
+    except ImportError:
+        return {"success": False, "error": "Library google-genai belum terinstall."}
+
+    client   = genai.Client(api_key=api_key)
+    p1_data  = scored_data.get("data", {})
+    segments = scored_data.get("segments", [])
+    top_idx  = p1_data.get("top_indices", [])[:5]
+    scored   = {s["index"]: s for s in p1_data.get("scored_segments", [])}
+    summary  = p1_data.get("video_summary", "")
+
+    # Ambil teks segmen asli untuk top candidates
+    seg_map = {s["index"]: s for s in segments}
+    top_segs_text = "\n\n".join(
+        f"[KANDIDAT #{i+1} — SEG-{idx} | posisi {seg_map.get(idx,{}).get('position_pct',0)}%]\n"
+        f"Score: viral={scored.get(idx,{}).get('viral_score',0)} "
+        f"emosi={scored.get(idx,{}).get('emotion_score',0)} "
+        f"quotable={scored.get(idx,{}).get('quotability',0)}\n"
+        f"Teks: {seg_map.get(idx,{}).get('text','')[:600]}"
+        for i, idx in enumerate(top_idx)
+    )
+
+    prompt = f"""Kamu adalah Senior Content Strategist YouTube sepak bola Indonesia.
+
+VIDEO: "{title or 'Video Sepak Bola'}"
+RINGKASAN: {summary}
+
+Berikut 5 segmen terpilih yang sudah di-score oleh AI scorer.
+Lakukan analisis mendalam dan buat hook konten untuk setiap segmen.
+
+{top_segs_text}
+
+TARGET: Fans sepak bola Indonesia 18-35 tahun, platform YouTube Shorts / TikTok / Reels.
+
+OUTPUT: JSON valid saja.
+
+{{
+  "video_summary": "{summary}",
   "clips": [
     {{
       "rank": 1,
-      "timestamp_hint": "Perkiraan posisi (misal: 'awal video', '5 menit pertama')",
-      "quote": "Kutipan langsung dari transkrip, maks 120 karakter",
+      "timestamp_hint": "Perkiraan posisi video (misal: '5 menit pertama', 'bagian tengah')",
+      "quote": "Kutipan langsung terbaik dari segmen, maks 120 karakter",
       "topic": "Topik singkat, maks 60 karakter",
-      "why_viral": "Alasan spesifik, maks 150 karakter",
+      "why_viral": "Alasan spesifik kenapa ini viral di Indonesia, maks 150 karakter",
       "emotion_trigger": "KONTROVERSI | EMOSIONAL | MENGEJUTKAN | HUMOR | INSPIRATIF",
       "viral_score": 8.5,
+      "score_breakdown": {{
+        "viral": 8.5,
+        "emosi": 7.0,
+        "quotable": 9.0,
+        "kontroversi": 6.0
+      }},
       "hooks": {{
         "kontroversial": {{
           "judul": "Hook yang memancing debat, maks 80 karakter",
@@ -357,41 +474,73 @@ OUTPUT: Hanya JSON valid, tidak ada teks lain.
   "posting_recommendation": "Strategi & waktu terbaik posting untuk Indonesia"
 }}
 
-Semua teks harus Bahasa Indonesia yang natural dan engaging.
+Semua teks Bahasa Indonesia yang natural, engaging, dan spesifik untuk pasar lokal."""
+
+    try:
+        raw  = _gemini_call(client, prompt, temperature=0.7, max_tokens=4096)
+        data = json.loads(_extract_json(raw))
+        return {"success": True, "data": data, "error": None}
+    except json.JSONDecodeError as e:
+        return {"success": False, "error": f"Gagal parse JSON Pass 2: {e}"}
+    except Exception as e:
+        return {"success": False, "error": f"Pass 2 error: {e}"}
+
+
+# ── LEGACY (single-pass fallback) ─────────────────────────────────────────────
+
+def analyze_with_gemini(transcript: str, title: str, api_key: str) -> dict:
+    """Single-pass fallback — dipakai manual input & jika 2-pass gagal."""
+    try:
+        from google import genai
+    except ImportError:
+        return {"success": False, "data": None, "raw": "",
+                "error": "Library google-genai belum terinstall."}
+
+    client = genai.Client(api_key=api_key)
+    prompt = f"""
+Kamu adalah Senior Content Strategist YouTube sepak bola Indonesia.
+Analisis transkrip berikut → deteksi 5 momen paling viral untuk Short Clip (≤60 detik).
+
+VIDEO: {title or 'tidak diketahui'}
+TRANSKRIP: {transcript[:8000]}
+
+OUTPUT: JSON valid saja.
+
+{{
+  "video_summary": "Ringkasan 1-2 kalimat",
+  "clips": [
+    {{
+      "rank": 1,
+      "timestamp_hint": "posisi dalam video",
+      "quote": "kutipan langsung maks 120 karakter",
+      "topic": "topik maks 60 karakter",
+      "why_viral": "alasan maks 150 karakter",
+      "emotion_trigger": "KONTROVERSI | EMOSIONAL | MENGEJUTKAN | HUMOR | INSPIRATIF",
+      "viral_score": 8.5,
+      "score_breakdown": {{"viral": 8.5, "emosi": 7.0, "quotable": 9.0, "kontroversi": 6.0}},
+      "hooks": {{
+        "kontroversial": {{"judul": "", "caption": "", "angle": ""}},
+        "emosional":     {{"judul": "", "caption": "", "angle": ""}},
+        "pertanyaan":    {{"judul": "", "caption": "", "angle": ""}}
+      }}
+    }}
+  ],
+  "top_hashtags": ["#tag1","#tag2","#tag3","#tag4","#tag5"],
+  "posting_recommendation": "waktu & strategi posting terbaik"
+}}
+
+Semua teks Bahasa Indonesia yang natural dan engaging.
 """
-
-    import time
-
-    # Auto-retry 2x jika kena rate limit (429)
-    for attempt in range(3):
-        try:
-            resp = client.models.generate_content(
-                model="gemini-2.0-flash",
-                contents=prompt,
-                config={
-                    "temperature": 0.7,
-                    "max_output_tokens": 4096,
-                },
-            )
-            raw  = resp.text.strip()
-            data = json.loads(_extract_json(raw))
-            return {"success": True, "data": data, "raw": raw, "error": None}
-
-        except json.JSONDecodeError as e:
-            return {"success": False, "data": None,
-                    "raw": locals().get("raw", ""),
-                    "error": f"Gagal parse JSON dari Gemini: {e}"}
-
-        except Exception as e:
-            err_str = str(e)
-            if "429" in err_str and attempt < 2:
-                time.sleep(35)
-                continue
-            return {"success": False, "data": None, "raw": "",
-                    "error": f"Gemini API error: {e}"}
-
-    return {"success": False, "data": None, "raw": "",
-            "error": "Gemini rate limit: semua retry gagal. Tunggu 1 menit lalu coba lagi."}
+    try:
+        raw  = _gemini_call(client, prompt, temperature=0.7, max_tokens=4096)
+        data = json.loads(_extract_json(raw))
+        return {"success": True, "data": data, "raw": raw, "error": None}
+    except json.JSONDecodeError as e:
+        return {"success": False, "data": None, "raw": "",
+                "error": f"Gagal parse JSON: {e}"}
+    except Exception as e:
+        return {"success": False, "data": None, "raw": "",
+                "error": f"Gemini error: {e}"}
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -415,18 +564,39 @@ _HOOK_TABS = [
 ]
 
 
+def _render_score_bars(breakdown: dict):
+    """Mini score bars untuk viral / emosi / quotable / kontroversi."""
+    dims = [
+        ("Viral",       breakdown.get("viral", 0),      "#3b82f6"),
+        ("Emosi",       breakdown.get("emosi", 0),       "#f87171"),
+        ("Quotable",    breakdown.get("quotable", 0),    "#34d399"),
+        ("Kontroversi", breakdown.get("kontroversi", 0), "#fbbf24"),
+    ]
+    bars = "".join(
+        f'<div style="margin-bottom:4px;">'
+        f'<div style="display:flex;justify-content:space-between;font-size:.65rem;color:#4a5878;">'
+        f'<span>{label}</span><span style="color:{color};">{val:.1f}</span></div>'
+        f'<div style="height:3px;background:#1a2640;border-radius:2px;">'
+        f'<div style="height:3px;width:{min(int(val*10),100)}%;background:{color};border-radius:2px;"></div>'
+        f'</div></div>'
+        for label, val, color in dims
+    )
+    st.markdown(f'<div style="padding:.5rem 0;">{bars}</div>', unsafe_allow_html=True)
+
+
 def _render_clip_card(clip: dict):
-    """Render satu kartu momen viral + 3 tab hook."""
-    rank    = clip.get("rank", "?")
-    topic   = clip.get("topic", "")
-    quote   = clip.get("quote", "")
-    why     = clip.get("why_viral", "")
-    emotion = clip.get("emotion_trigger", "")
-    score   = float(clip.get("viral_score", 0))
-    ts      = clip.get("timestamp_hint", "")
-    hooks   = clip.get("hooks", {})
-    color   = _SCORE_COLOR(score)
-    ebadge  = _EMOTION_BADGE.get(emotion, "b-cyan")
+    """Render satu kartu momen viral + score breakdown + 3 tab hook."""
+    rank      = clip.get("rank", "?")
+    topic     = clip.get("topic", "")
+    quote     = clip.get("quote", "")
+    why       = clip.get("why_viral", "")
+    emotion   = clip.get("emotion_trigger", "")
+    score     = float(clip.get("viral_score", 0))
+    ts        = clip.get("timestamp_hint", "")
+    hooks     = clip.get("hooks", {})
+    breakdown = clip.get("score_breakdown", {})
+    color     = _SCORE_COLOR(score)
+    ebadge    = _EMOTION_BADGE.get(emotion, "b-cyan")
 
     st.markdown(f"""
     <div class="cd-card" style="border-left: 3px solid {color};">
@@ -453,6 +623,11 @@ def _render_clip_card(clip: dict):
         </div>
     </div>
     """, unsafe_allow_html=True)
+
+    # Score breakdown (jika ada)
+    if breakdown:
+        with st.expander("📊 Score Breakdown", expanded=False):
+            _render_score_bars(breakdown)
 
     # ── 3 Hook Tabs ──────────────────────────────────────────────────────────
     tabs = st.tabs([label for label, _ in _HOOK_TABS])
@@ -540,7 +715,7 @@ def render():
     st.markdown("""
     <div class="cd-header">
         <h2>🎬 Clip Detector</h2>
-        <p>Deteksi otomatis 5 momen viral dari video YouTube — powered by Gemini 2.0 Flash</p>
+        <p>Deteksi otomatis 5 momen viral — 2-Pass AI Pipeline: Gemini Scorer → Gemini Deep Analyzer</p>
     </div>
     """, unsafe_allow_html=True)
 
@@ -581,114 +756,156 @@ def render():
             )
         else:
             api_key = st.text_input(
-                "🔑 Gemini API Key",
+                "Gemini API Key",
                 type="password",
-                placeholder="AQ... atau AIza...",
-                help="Isi secrets.toml agar tidak perlu input setiap kali. "
-                     "Dapatkan key di aistudio.google.com/app/apikey",
+                placeholder="AIza... atau AQ...",
+                help="Dapatkan di aistudio.google.com/app/apikey",
             )
 
-        st.markdown("</div>", unsafe_allow_html=True)
+        # ── Manual transcript toggle ─────────────────────────────────────────
+        use_manual = st.checkbox("✍️ Masukkan transkrip manual (tanpa URL)")
+        manual_transcript = ""
+        if use_manual:
+            manual_transcript = st.text_area(
+                "Teks Transkrip",
+                height=200,
+                placeholder="Paste transkrip di sini...",
+            )
 
-    # ── Tombol Analisis ───────────────────────────────────────────────────────
-    col_btn, _ = st.columns([1, 3])
-    with col_btn:
-        run = st.button("🚀 Analisis Sekarang", use_container_width=True)
+        st.markdown('</div>', unsafe_allow_html=True)
 
-    if run:
-        # Validasi
-        if not url.strip():
-            st.warning("⚠️ Masukkan URL YouTube.")
+    # ── Tombol Proses ────────────────────────────────────────────────────────
+    btn_cols = st.columns([1, 2, 1])
+    with btn_cols[1]:
+        run = st.button("🚀 Proses Video", type="primary", use_container_width=True)
+
+    if not run:
+        # Tampilkan hasil sebelumnya jika ada
+        if "cd_result" in st.session_state and st.session_state["cd_result"]:
+            st.divider()
+            st.caption("📌 Hasil terakhir — tekan 'Proses Video' untuk analisis baru")
+            _render_results(st.session_state["cd_result"])
+        return
+
+    # ── Validasi input ───────────────────────────────────────────────────────
+    if not api_key:
+        st.error("❌ Masukkan Gemini API Key terlebih dahulu.")
+        return
+
+    # ── Mode: Manual Transcript ──────────────────────────────────────────────
+    if use_manual:
+        if not manual_transcript.strip():
+            st.error("❌ Transkrip tidak boleh kosong.")
             return
-        if not api_key.strip():
-            st.warning("⚠️ Isi Gemini API Key di .streamlit/secrets.toml atau input di atas.")
-            return
 
-        # ── Step 1: Fetch Transkrip ───────────────────────────────────────
-        import os as _os
-        _on_cloud = (
-            _os.environ.get("STREAMLIT_SHARING_MODE")
-            or _os.environ.get("HOME", "").startswith("/home/appuser")
-        )
-        with st.status("📥 Mengambil transkrip otomatis...", expanded=True) as status:
-            if _on_cloud:
-                st.write("☁️ Mode cloud — mencoba yt-dlp & youtube-transcript-api...")
-            else:
-                st.write("🔄 Mencoba Layer 1 — yt-dlp + Chrome cookies...")
-                st.write("🔄 Mencoba Layer 2 — yt-dlp + Edge cookies...")
-                st.write("🔄 Mencoba Layer 3 — yt-dlp + Firefox cookies...")
-                st.write("🔄 Mencoba Layer 4 — yt-dlp tanpa cookies...")
-            st.write("🔄 Mencoba youtube-transcript-api...")
-            result = fetch_transcript(url)
+        transcript = manual_transcript.strip()
+        st.session_state["cd_transcript"] = transcript
 
-            if result["success"]:
-                status.update(
-                    label=f"✅ Transkrip via {result['method']} ({len(result['transcript'])} karakter)",
-                    state="complete",
-                )
+        with st.expander("📄 Preview Transkrip"):
+            word_count = len(transcript.split())
+            st.caption(f"📝 {word_count} kata · {len(transcript)} karakter")
+            st.text(transcript[:600] + ("..." if len(transcript) > 600 else ""))
+
+        # Single-pass untuk manual input
+        with st.status("🤖 Menganalisis transkrip manual...", expanded=True) as status:
+            st.write("Mendeteksi momen viral & membuat hook options...")
+            gresult = analyze_with_gemini(transcript, title, api_key)
+            if gresult["success"]:
+                status.update(label="✅ Analisis selesai!", state="complete")
             else:
-                st.write(f"❌ {result['error']}")
-                status.update(label="⚠️ Transkrip otomatis gagal", state="error")
-                if _on_cloud:
-                    st.warning(
-                        "Di Streamlit Cloud, subtitle harus aktif di video. "
-                        "Gunakan **Input Manual** di bawah untuk copy-paste transkrip."
-                    )
-                else:
-                    st.info("Gunakan **Input Manual Transkrip** di bawah untuk melanjutkan.")
+                status.update(label=f"❌ {gresult['error']}", state="error")
+                st.error(gresult["error"])
+                return
+
+        st.session_state["cd_result"] = gresult["data"]
+        _render_results(gresult["data"])
+        return
+
+    # ── Mode: URL YouTube — 2-Pass Pipeline ─────────────────────────────────
+    if not url:
+        st.error("❌ Masukkan URL YouTube atau aktifkan input manual.")
+        return
+
+    # ── Step 1: Fetch Transcript ─────────────────────────────────────────────
+    with st.status("📥 Mengambil transkrip dari YouTube...", expanded=True) as status:
+        st.write("Mencoba beberapa metode bypass...")
+        result = fetch_transcript(url)
 
         if result["success"]:
-            transcript = result["transcript"]
-            st.session_state["cd_transcript"] = transcript
+            method = result.get("method", "unknown")
+            chars  = len(result["transcript"])
+            words  = len(result["transcript"].split())
+            status.update(
+                label=f"✅ Transkrip berhasil diambil via {method} ({words} kata)",
+                state="complete",
+            )
+        else:
+            status.update(label=f"❌ {result['error']}", state="error")
+            st.error(result["error"])
+            with st.expander("💡 Tips"):
+                st.markdown("""
+                - Pastikan video punya **auto-caption** YouTube  
+                - Coba video yang lebih populer / berbahasa Indonesia  
+                - Gunakan **✍️ Input Manual** di atas jika punya transkrip sendiri
+                """)
+            return
 
-            with st.expander("📄 Preview Transkrip"):
-                st.text(transcript[:600] + ("..." if len(transcript) > 600 else ""))
+    transcript = result["transcript"]
+    st.session_state["cd_transcript"] = transcript
 
-            # ── Step 2: Gemini Analysis ───────────────────────────────────
-            with st.status("🤖 Menganalisis dengan Gemini 1.5 Pro...", expanded=True) as status:
-                st.write("Mendeteksi momen viral & membuat hook options...")
-                gresult = analyze_with_gemini(transcript, title, api_key)
+    with st.expander("📄 Preview Transkrip"):
+        word_count = len(transcript.split())
+        st.caption(f"📝 {word_count} kata · {len(transcript)} karakter")
+        st.text(transcript[:600] + ("..." if len(transcript) > 600 else ""))
 
-                if gresult["success"]:
-                    status.update(label="✅ Analisis selesai!", state="complete")
-                else:
-                    status.update(label=f"❌ {gresult['error']}", state="error")
-                    st.error(gresult["error"])
-                    return
+    # ── Pass 1: Segment Scorer ────────────────────────────────────────────
+    with st.status("⚡ Pass 1 — Gemini Scorer: scanning semua segmen...",
+                   expanded=True) as status:
+        st.write("🔍 Membagi transcript menjadi segmen-segmen...")
+        p1 = score_segments(transcript, title, api_key)
 
-            st.session_state["cd_result"] = gresult["data"]
-            _render_results(gresult["data"])
+        if p1["success"]:
+            n_segs  = len(p1.get("segments", []))
+            n_top   = len(p1["data"].get("top_indices", []))
+            status.update(
+                label=f"✅ Pass 1 selesai — {n_segs} segmen di-scan, {n_top} kandidat terpilih",
+                state="complete",
+            )
+            # Preview scoring
+            top_idx = p1["data"].get("top_indices", [])
+            scored  = {s["index"]: s for s in p1["data"].get("scored_segments", [])}
+            cols = st.columns(min(len(top_idx), 5))
+            for col, idx in zip(cols, top_idx):
+                s = scored.get(idx, {})
+                col.metric(
+                    f"Seg-{idx} ({s.get('position_pct',0)}%)",
+                    f"{s.get('composite', s.get('viral_score', 0)):.1f}",
+                    s.get("topic", "")[:20],
+                )
+        else:
+            status.update(label=f"⚠️ Pass 1 gagal, fallback ke single-pass", state="error")
+            st.warning(f"Pass 1: {p1['error']} — menggunakan single-pass.")
 
-    # ── Tampilkan hasil sebelumnya (jika ada di session) ─────────────────────
-    elif "cd_result" in st.session_state and not run:
-        st.caption("📌 Menampilkan hasil analisis terakhir. Klik Analisis Sekarang untuk refresh.")
-        _render_results(st.session_state["cd_result"])
+    # ── Pass 2: Deep Analyzer ─────────────────────────────────────────────
+    with st.status("🧠 Pass 2 — Gemini Deep Analyzer: analisis kandidat terbaik...",
+                   expanded=True) as status:
+        st.write("Membuat hook, caption, dan strategi konten...")
 
-    # ── Manual Input (selalu tampil di bawah sebagai fallback) ───────────────
-    st.markdown("---")
-    with st.expander("✍️ Input Manual Transkrip (Fallback)"):
-        st.markdown("""
-        <div style="font-size:.82rem;color:#8892a4;margin-bottom:.75rem;">
-        Cara dapat transkrip manual:<br>
-        1. Buka video YouTube → klik <b>⋮</b> → <b>Open transcript</b> → copy semua<br>
-        2. Atau pakai ekstensi Chrome: <a href="https://tactiq.io" target="_blank" style="color:#00d4ff;">Tactiq.io</a>
-        </div>
-        """, unsafe_allow_html=True)
+        if p1["success"]:
+            gresult = analyze_top_clips(p1, title, api_key)
+        else:
+            gresult = analyze_with_gemini(transcript, title, api_key)
 
-        manual_text = st.text_area(
-            "Paste transkrip:",
-            height=200,
-            placeholder="Paste teks transkrip di sini...",
-            key="cd_manual_text",
-        )
-        manual_title = st.text_input(
-            "Judul video:",
-            key="cd_manual_title",
-        )
-        manual_key = st.text_input(
-            "Gemini API Key:",
-            type="password",
-            key="cd_manual_key",
+        if gresult["success"]:
+            status.update(label="✅ Pass 2 selesai — analisis lengkap!", state="complete")
+        else:
+            status.update(label=f"❌ {gresult['error']}", state="error")
+            st.error(gresult["error"])
+            return
+
+    st.session_state["cd_result"] = gresult["data"]
+    _render_results(gresult["data"])
+           key="cd_manual_key",
             help="Bisa berbeda dari input di atas",
         )
 
