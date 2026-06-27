@@ -19,7 +19,7 @@ if not exist ".git" (
 
 REM -- Pastikan remote origin sudah benar
 git remote remove origin 2>nul
-git remote add origin https://github.com/richifajar/ftbl7_labs.git
+git remote add origin https://github.com/richifajar80-svg/ftbl7_labs.git
 
 echo.
 echo [1] Menambahkan semua perubahan...
