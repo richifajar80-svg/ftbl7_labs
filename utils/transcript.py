@@ -1,11 +1,13 @@
 # =============================================================================
 # utils/transcript.py
-# Mengambil transkrip YouTube dengan multi-layer bypass strategy.
+# Multi-layer transcript fetcher — dioptimasi untuk local run
 #
-# Strategi (berurutan — jika gagal, lanjut ke berikutnya):
-#   1. youtube-transcript-api langsung (paling cepat)
-#   2. yt-dlp — mengekstrak subtitle dari .vtt/.srt
-#   3. Manual input (dipanggil dari UI, bukan dari sini)
+# Urutan bypass:
+#   1. yt-dlp + cookies dari Chrome (paling ampuh, lokal)
+#   2. yt-dlp + cookies dari Edge
+#   3. yt-dlp + cookies dari Firefox
+#   4. yt-dlp tanpa cookies (fallback)
+#   5. youtube-transcript-api (direct API)
 # =============================================================================
 
 import re
@@ -16,121 +18,114 @@ from typing import Optional
 
 
 def extract_video_id(url: str) -> Optional[str]:
-    """Ekstrak video ID dari berbagai format URL YouTube."""
-    patterns = [
-        r"(?:v=|youtu\.be/|embed/|shorts/)([A-Za-z0-9_-]{11})",
-    ]
-    for pattern in patterns:
-        match = re.search(pattern, url)
-        if match:
-            return match.group(1)
-    return None
+    """Ekstrak 11-karakter video ID dari URL YouTube."""
+    match = re.search(r"(?:v=|youtu\.be/|embed/|shorts/)([A-Za-z0-9_-]{11})", url)
+    return match.group(1) if match else None
 
 
-def fetch_via_api(video_id: str, language: str = "id") -> Optional[str]:
+# ── yt-dlp helpers ────────────────────────────────────────────────────────────
+
+def _run_ytdlp(url: str, extra_args: list = []) -> Optional[str]:
     """
-    Metode 1: youtube-transcript-api
-    Mencoba bahasa Indonesia dulu, fallback ke Inggris, lalu auto-generated.
+    Jalankan yt-dlp untuk download subtitle .vtt lalu parse ke plain text.
+    extra_args: argumen tambahan seperti --cookies-from-browser chrome
     """
-    try:
-        from youtube_transcript_api import YouTubeTranscriptApi, TranscriptsDisabled, NoTranscriptFound
-
-        # Prioritas bahasa
-        lang_priority = [language, "id", "en", "en-US"]
-
-        try:
-            transcript_list = YouTubeTranscriptApi.list_transcripts(video_id)
-
-            # Coba manual transcript dulu (lebih akurat)
-            for lang in lang_priority:
-                try:
-                    transcript = transcript_list.find_manually_created_transcript([lang])
-                    entries = transcript.fetch()
-                    return _entries_to_text(entries)
-                except Exception:
-                    pass
-
-            # Fallback ke auto-generated
-            for lang in lang_priority:
-                try:
-                    transcript = transcript_list.find_generated_transcript([lang])
-                    entries = transcript.fetch()
-                    return _entries_to_text(entries)
-                except Exception:
-                    pass
-
-            # Last resort: ambil yang tersedia apa saja dan translate ke ID
-            available = list(transcript_list)
-            if available:
-                entries = available[0].fetch()
-                return _entries_to_text(entries)
-
-        except (TranscriptsDisabled, NoTranscriptFound):
-            return None
-
-    except ImportError:
-        pass
-    except Exception:
-        pass
-
-    return None
-
-
-def fetch_via_ytdlp(url: str) -> Optional[str]:
-    """
-    Metode 2: yt-dlp
-    Download subtitle sebagai .vtt, parse menjadi plain text.
-    Berguna saat youtube-transcript-api diblokir oleh IP.
-    """
-    try:
-        import yt_dlp  # noqa: F401 — cek ketersediaan
-    except ImportError:
-        return None
-
     with tempfile.TemporaryDirectory() as tmpdir:
-        output_template = os.path.join(tmpdir, "%(id)s")
         cmd = [
-            "yt-dlp",
+            "python", "-m", "yt_dlp",
             "--write-auto-sub",
             "--write-sub",
             "--sub-lang", "id,en",
             "--sub-format", "vtt",
             "--skip-download",
             "--no-playlist",
-            "-o", output_template,
-            url,
-        ]
+            "--quiet",
+            "-o", os.path.join(tmpdir, "%(id)s"),
+        ] + extra_args + [url]
 
         try:
             result = subprocess.run(
                 cmd,
                 capture_output=True,
                 text=True,
-                timeout=60,
+                timeout=90,
             )
 
-            # Cari file .vtt yang dihasilkan
             for fname in os.listdir(tmpdir):
                 if fname.endswith(".vtt"):
-                    vtt_path = os.path.join(tmpdir, fname)
-                    with open(vtt_path, "r", encoding="utf-8") as f:
-                        return _parse_vtt(f.read())
+                    fpath = os.path.join(tmpdir, fname)
+                    with open(fpath, encoding="utf-8") as f:
+                        text = _parse_vtt(f.read())
+                    if len(text) > 100:
+                        return text
 
-        except (subprocess.TimeoutExpired, FileNotFoundError, Exception):
+        except Exception:
             pass
 
     return None
 
 
+def _layer1_ytdlp_chrome(url: str) -> Optional[str]:
+    """Layer 1: yt-dlp dengan cookies Chrome (user sudah login YouTube)."""
+    return _run_ytdlp(url, ["--cookies-from-browser", "chrome"])
+
+
+def _layer2_ytdlp_edge(url: str) -> Optional[str]:
+    """Layer 2: yt-dlp dengan cookies Edge."""
+    return _run_ytdlp(url, ["--cookies-from-browser", "edge"])
+
+
+def _layer3_ytdlp_firefox(url: str) -> Optional[str]:
+    """Layer 3: yt-dlp dengan cookies Firefox."""
+    return _run_ytdlp(url, ["--cookies-from-browser", "firefox"])
+
+
+def _layer4_ytdlp_plain(url: str) -> Optional[str]:
+    """Layer 4: yt-dlp tanpa cookies."""
+    return _run_ytdlp(url, [])
+
+
+def _layer5_api(video_id: str) -> Optional[str]:
+    """Layer 5: youtube-transcript-api (direct, sering diblokir bot detection)."""
+    try:
+        from youtube_transcript_api import YouTubeTranscriptApi
+
+        tl = YouTubeTranscriptApi.list_transcripts(video_id)
+
+        for manual in [True, False]:
+            for lang in ["id", "en", "en-US"]:
+                try:
+                    t = (tl.find_manually_created_transcript([lang]) if manual
+                         else tl.find_generated_transcript([lang]))
+                    entries = t.fetch()
+                    return " ".join(e.get("text", "") for e in entries).strip()
+                except Exception:
+                    pass
+
+        # Last resort — transcript pertama yang ada
+        for t in tl:
+            try:
+                return " ".join(e.get("text", "") for e in t.fetch()).strip()
+            except Exception:
+                pass
+
+    except Exception:
+        pass
+
+    return None
+
+
+# ── Main entry point ──────────────────────────────────────────────────────────
+
 def get_transcript(url: str) -> dict:
     """
-    Fungsi utama: coba semua metode secara berurutan.
+    Ambil transkrip dengan 5-layer bypass.
 
     Returns:
         {
             "success": bool,
             "transcript": str | None,
-            "method": str,       # "api" | "ytdlp" | "failed"
+            "method": str,
             "video_id": str | None,
             "error": str | None,
         }
@@ -138,86 +133,62 @@ def get_transcript(url: str) -> dict:
     video_id = extract_video_id(url)
     if not video_id:
         return {
-            "success": False,
-            "transcript": None,
-            "method": "failed",
-            "video_id": None,
-            "error": "URL YouTube tidak valid. Contoh: https://youtube.com/watch?v=xxxxx",
+            "success": False, "transcript": None,
+            "method": "none", "video_id": None,
+            "error": "URL YouTube tidak valid.",
         }
 
-    # Metode 1: youtube-transcript-api
-    transcript = fetch_via_api(video_id)
-    if transcript and len(transcript) > 100:
-        return {
-            "success": True,
-            "transcript": transcript,
-            "method": "api",
-            "video_id": video_id,
-            "error": None,
-        }
+    layers = [
+        ("yt-dlp + Chrome cookies",  lambda: _layer1_ytdlp_chrome(url)),
+        ("yt-dlp + Edge cookies",    lambda: _layer2_ytdlp_edge(url)),
+        ("yt-dlp + Firefox cookies", lambda: _layer3_ytdlp_firefox(url)),
+        ("yt-dlp (no cookies)",      lambda: _layer4_ytdlp_plain(url)),
+        ("youtube-transcript-api",   lambda: _layer5_api(video_id)),
+    ]
 
-    # Metode 2: yt-dlp
-    transcript = fetch_via_ytdlp(url)
-    if transcript and len(transcript) > 100:
-        return {
-            "success": True,
-            "transcript": transcript,
-            "method": "ytdlp",
-            "video_id": video_id,
-            "error": None,
-        }
+    for method_name, fetch_fn in layers:
+        try:
+            result = fetch_fn()
+            if result and len(result) > 100:
+                return {
+                    "success": True,
+                    "transcript": result,
+                    "method": method_name,
+                    "video_id": video_id,
+                    "error": None,
+                }
+        except Exception:
+            continue
 
-    # Semua metode gagal
     return {
         "success": False,
         "transcript": None,
-        "method": "failed",
+        "method": "none",
         "video_id": video_id,
         "error": (
-            "Transkrip tidak tersedia secara otomatis. "
-            "Kemungkinan: subtitle dinonaktifkan, IP diblokir, atau video baru. "
-            "Gunakan Input Manual di bawah."
+            "Semua metode otomatis gagal. Kemungkinan: "
+            "subtitle dinonaktifkan creator, atau video baru (<24 jam). "
+            "Gunakan Input Manual."
         ),
     }
 
 
-# ── Helpers ──────────────────────────────────────────────────────────────────
+# ── VTT parser ────────────────────────────────────────────────────────────────
 
-def _entries_to_text(entries: list) -> str:
-    """Gabungkan list transcript entries menjadi satu string plain text."""
-    return " ".join(entry.get("text", "") for entry in entries if entry.get("text")).strip()
-
-
-def _parse_vtt(vtt_content: str) -> str:
-    """Parse konten VTT menjadi plain text, buang tag HTML dan timestamp."""
-    import re
-    # Buang header WEBVTT
-    lines = vtt_content.split("\n")
-    text_lines = []
-    for line in lines:
+def _parse_vtt(content: str) -> str:
+    """Parse .vtt subtitle → plain text bersih."""
+    lines, prev = [], None
+    for line in content.splitlines():
         line = line.strip()
-        # Skip baris kosong, header, timestamp, dan cue ID
         if not line:
             continue
-        if line.startswith("WEBVTT") or line.startswith("NOTE") or line.startswith("Kind:") or line.startswith("Language:"):
+        if line.startswith(("WEBVTT", "NOTE", "Kind:", "Language:")):
             continue
         if re.match(r"^\d{2}:\d{2}:\d{2}", line) or re.match(r"^[\d\s]+$", line):
             continue
-        # Buang tag HTML
-        clean = re.sub(r"<[^>]+>", "", line)
-        clean = re.sub(r"&amp;", "&", clean)
-        clean = re.sub(r"&lt;", "<", clean)
-        clean = re.sub(r"&gt;", ">", clean)
-        clean = clean.strip()
-        if clean:
-            text_lines.append(clean)
-
-    # Deduplicate baris berurutan yang sama
-    deduped = []
-    prev = None
-    for line in text_lines:
-        if line != prev:
-            deduped.append(line)
-            prev = line
-
-    return " ".join(deduped)
+        clean = re.sub(r"<[^>]+>", "", line).strip()
+        clean = clean.replace("&amp;", "&").replace("&lt;", "<").replace("&gt;", ">")
+        if clean and clean != prev:
+            lines.append(clean)
+            prev = clean
+    return " ".join(lines)

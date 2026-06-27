@@ -10,8 +10,8 @@ youtube-transcript-api>=0.6.2
 # yt-dlp (Metode 2 — Bypass IP restrictions)
 yt-dlp>=2024.5.0
 
-# Google Gemini AI
-google-generativeai>=0.7.0
+# Google Gemini AI (SDK baru — support key format AQ.)
+google-genai>=1.0.0
 
 # Data & Analysis
 pandas>=2.0.0

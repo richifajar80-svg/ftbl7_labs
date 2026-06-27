@@ -1,44 +1,54 @@
 @echo off
 echo ================================================
-echo  FTBL7 Labs - Push to GitHub
+echo  FTBL7 Labs - Push Update ke GitHub
 echo ================================================
 echo.
 
 cd /d "%~dp0"
 
-echo [0/6] Set identitas Git...
+echo [0] Set identitas Git...
 git config --global user.email "richifajar80@gmail.com"
 git config --global user.name "richifajar"
-echo Identitas OK
-echo.
 
-echo [1/6] git init...
-git init
-echo.
+REM -- Inisialisasi repo jika belum ada
+if not exist ".git" (
+    echo [INIT] Repo baru, melakukan git init...
+    git init
+    git branch -M main
+)
 
-echo [2/6] git add semua file...
-git add .
-echo.
-
-echo [3/6] git commit...
-git commit -m "Initial commit: FTBL7 Labs Dashboard v1.0"
-echo STATUS: %ERRORLEVEL%
-echo.
-
-echo [4/6] set branch main...
-git branch -M main
-echo.
-
-echo [5/6] remote + push...
+REM -- Pastikan remote origin sudah benar
 git remote remove origin 2>nul
 git remote add origin https://github.com/richifajar/ftbl7_labs.git
 
-echo [6/6] Pushing ke GitHub...
-git push -u origin main
-echo STATUS PUSH: %ERRORLEVEL%
+echo.
+echo [1] Menambahkan semua perubahan...
+git add .
 echo.
 
-echo ================================================
-echo  Cek: https://github.com/richifajar/ftbl7_labs
-echo ================================================
+echo [2] Commit message (Enter untuk pakai default):
+set /p MSG="Pesan commit: "
+if "%MSG%"=="" set MSG=Update: FTBL7 Labs Dashboard
+
+git commit -m "%MSG%"
+echo.
+
+echo [3] Push ke GitHub...
+git branch -M main
+git push -u origin main
+echo.
+
+if %ERRORLEVEL%==0 (
+    echo ================================================
+    echo  BERHASIL! Cek di:
+    echo  https://github.com/richifajar/ftbl7_labs
+    echo ================================================
+) else (
+    echo ================================================
+    echo  Jika ada konflik, jalankan dulu:
+    echo    git pull origin main --rebase
+    echo  lalu jalankan file ini lagi.
+    echo ================================================
+)
+echo.
 pause
