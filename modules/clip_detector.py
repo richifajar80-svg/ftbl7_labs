@@ -563,8 +563,12 @@ def render():
             )
 
         # ── API Key: baca dari st.secrets dulu, fallback ke manual input ────
-        _secret_key = st.secrets.get("GEMINI_API_KEY", "") if hasattr(st, "secrets") else ""
-        _key_loaded  = bool(_secret_key and _secret_key != "GANTI_DENGAN_API_KEY_ANDA")
+        _secret_key = ""
+        try:
+            _secret_key = st.secrets["GEMINI_API_KEY"]
+        except Exception:
+            pass
+        _key_loaded = bool(_secret_key and _secret_key not in ("", "GANTI_DENGAN_API_KEY_ANDA"))
 
         if _key_loaded:
             api_key = _secret_key
@@ -601,22 +605,37 @@ def render():
             return
 
         # ── Step 1: Fetch Transkrip ───────────────────────────────────────
+        import os as _os
+        _on_cloud = (
+            _os.environ.get("STREAMLIT_SHARING_MODE")
+            or _os.environ.get("HOME", "").startswith("/home/appuser")
+        )
         with st.status("📥 Mengambil transkrip otomatis...", expanded=True) as status:
-            st.write("🔄 Mencoba Layer 1 — yt-dlp + Chrome cookies...")
-            st.write("🔄 Mencoba Layer 2 — yt-dlp + Edge cookies (jika Layer 1 gagal)...")
-            st.write("🔄 Mencoba Layer 3 — yt-dlp tanpa cookies (jika Layer 2 gagal)...")
-            st.write("🔄 Mencoba Layer 4 — youtube-transcript-api (jika Layer 3 gagal)...")
+            if _on_cloud:
+                st.write("☁️ Mode cloud — mencoba yt-dlp & youtube-transcript-api...")
+            else:
+                st.write("🔄 Mencoba Layer 1 — yt-dlp + Chrome cookies...")
+                st.write("🔄 Mencoba Layer 2 — yt-dlp + Edge cookies...")
+                st.write("🔄 Mencoba Layer 3 — yt-dlp + Firefox cookies...")
+                st.write("🔄 Mencoba Layer 4 — yt-dlp tanpa cookies...")
+            st.write("🔄 Mencoba youtube-transcript-api...")
             result = fetch_transcript(url)
 
             if result["success"]:
                 status.update(
-                    label=f"✅ Transkrip ditemukan via {result['method']} ({len(result['transcript'])} karakter)",
+                    label=f"✅ Transkrip via {result['method']} ({len(result['transcript'])} karakter)",
                     state="complete",
                 )
             else:
                 st.write(f"❌ {result['error']}")
-                status.update(label="⚠️ Semua layer otomatis gagal", state="error")
-                st.info("Gunakan **Input Manual Transkrip** di bawah untuk melanjutkan.")
+                status.update(label="⚠️ Transkrip otomatis gagal", state="error")
+                if _on_cloud:
+                    st.warning(
+                        "Di Streamlit Cloud, subtitle harus aktif di video. "
+                        "Gunakan **Input Manual** di bawah untuk copy-paste transkrip."
+                    )
+                else:
+                    st.info("Gunakan **Input Manual Transkrip** di bawah untuk melanjutkan.")
 
         if result["success"]:
             transcript = result["transcript"]

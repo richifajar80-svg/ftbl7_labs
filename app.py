@@ -5,6 +5,7 @@
 import base64
 import streamlit as st
 from modules.clip_detector import render as render_clip_detector
+from modules.trend_sentiment import render as render_trend_sentiment
 
 
 # ── SVG logo as base64 data URI (bypass Streamlit HTML sanitizer) ─────────────
@@ -545,6 +546,9 @@ def page_clip_detector():
 
 
 def page_trend_sentiment():
+    render_trend_sentiment()
+
+def _page_trend_sentiment_old():
     st.markdown("""
     <div style="padding-top:1rem;">
         <h1>📊 Trend & Sentiment</h1>
