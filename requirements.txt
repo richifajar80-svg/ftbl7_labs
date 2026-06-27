@@ -1,0 +1,28 @@
+# ── FTBL7 Labs — Requirements ──────────────────────────────────────────────
+# Install: pip install -r requirements.txt
+
+# Core
+streamlit>=1.35.0
+
+# YouTube Transcript (Metode 1 — Direct API)
+youtube-transcript-api>=0.6.2
+
+# yt-dlp (Metode 2 — Bypass IP restrictions)
+yt-dlp>=2024.5.0
+
+# Google Gemini AI
+google-generativeai>=0.7.0
+
+# Data & Analysis
+pandas>=2.0.0
+numpy>=1.26.0
+
+# HTTP Requests
+requests>=2.31.0
+
+# Visualisasi (untuk Modul Trend & Sentiment)
+plotly>=5.18.0
+altair>=5.2.0
+
+# Utilities
+python-dotenv>=1.0.0
